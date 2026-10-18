@@ -1,0 +1,156 @@
+services:
+  postgres:
+    image: postgres:17.11
+    container_name: simple-krs-postgres
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      - krs-db-net
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres-replica:
+    image: postgres:17.11
+    container_name: simple-krs-postgres-replica
+    restart: unless-stopped
+
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: postgres
+      PRIMARY_PORT: 5432
+      REPLICATION_USER: ${POSTGRES_REPLICATION_USER}
+      REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD}
+
+    ports:
+      - "5434:5432"
+
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+
+    networks:
+      - krs-db-net
+
+    entrypoint:
+      - /bin/bash
+      - -ec
+
+    command:
+      - |
+        mkdir -p "$${PGDATA}"
+        chown postgres:postgres "$${PGDATA}"
+
+        if [ ! -s "$${PGDATA}/PG_VERSION" ]; then
+          echo "Menunggu Primary siap menerima koneksi..."
+
+          until pg_isready \
+            -h "$${PRIMARY_HOST}" \
+            -p "$${PRIMARY_PORT}" \
+            -d postgres; do
+            sleep 2
+          done
+
+          echo "Primary siap. Memulai pg_basebackup..."
+
+          PGPASSWORD="$${REPLICATION_PASSWORD}" \
+            gosu postgres pg_basebackup \
+              -h "$${PRIMARY_HOST}" \
+              -p "$${PRIMARY_PORT}" \
+              -U "$${REPLICATION_USER}" \
+              -D "$${PGDATA}" \
+              -Fp \
+              -Xs \
+              -P \
+              -R
+
+          echo "Bootstrap Replica selesai."
+        else
+          echo "Data Replica sudah tersedia. Melewati pg_basebackup."
+        fi
+
+        printf '%s:%s:*:%s:%s\n' \
+          "$${PRIMARY_HOST}" \
+          "$${PRIMARY_PORT}" \
+          "$${REPLICATION_USER}" \
+          "$${REPLICATION_PASSWORD}" \
+          > /var/lib/postgresql/.pgpass
+
+        chown postgres:postgres /var/lib/postgresql/.pgpass
+        chmod 0600 /var/lib/postgresql/.pgpass
+
+        exec /usr/local/bin/docker-entrypoint.sh postgres
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${REPLICATION_USER}" -d postgres
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  dbgate:
+    image: dbgate/dbgate:7.3.1
+    container_name: simple-krs-dbgate
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${DBGATE_PORT:-3000}:3000"
+    environment:
+      LOGIN: ${DBGATE_LOGIN}
+      PASSWORD: ${DBGATE_PASSWORD}
+      CONNECTIONS: postgres,postgres_replica
+
+      LABEL_postgres: PostgreSQL Primary
+      SERVER_postgres: postgres
+      PORT_postgres: 5432
+      USER_postgres: ${POSTGRES_USER}
+      PASSWORD_postgres: ${POSTGRES_PASSWORD}
+      DATABASE_postgres: ${POSTGRES_DB}
+      ENGINE_postgres: postgres@dbgate-plugin-postgres
+
+      LABEL_postgres_replica: PostgreSQL Replica
+      SERVER_postgres_replica: postgres-replica
+      PORT_postgres_replica: 5432
+      USER_postgres_replica: ${POSTGRES_USER}
+      PASSWORD_postgres_replica: ${POSTGRES_PASSWORD}
+      DATABASE_postgres_replica: ${POSTGRES_DB}
+      ENGINE_postgres_replica: postgres@dbgate-plugin-postgres
+      READONLY_postgres_replica: "1"
+    volumes:
+      - dbgate-data:/root/.dbgate
+    networks:
+      - krs-db-net
+
+volumes:
+  postgres-data:
+  postgres-replica-data:
+  dbgate-data:
+
+networks:
+  krs-db-net:
+    driver: bridge
